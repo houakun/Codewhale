@@ -72,6 +72,14 @@ impl PreviewCache {
         }
     }
 
+    /// Drop one session's cached preview.
+    ///
+    /// The cached lines embed the stored title, so anything that rewrites the
+    /// session on disk must invalidate them (#6555 U08-09).
+    fn invalidate(&mut self, id: &str) {
+        self.entries.retain(|(key, _)| key != id);
+    }
+
     #[cfg(test)]
     fn len(&self) -> usize {
         self.entries.len()
@@ -148,10 +156,22 @@ impl SessionPickerView {
     /// other workspaces are hidden by default — press `a` inside the
     /// picker to expand to all workspaces (#1395).
     pub fn new(workspace: &Path, locale: Locale) -> Self {
-        let sessions = SessionManager::default_location()
+        let (sessions, load_error) = match SessionManager::default_location()
             .and_then(|manager| manager.list_sessions())
-            .unwrap_or_default();
-        Self::from_session_list(workspace, locale, sessions)
+        {
+            Ok(sessions) => (sessions, None),
+            // An unreadable store used to render as "no sessions", which reads as
+            // "you have none" rather than "the store could not be read"
+            // (#6555 U08-09).
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        let mut view = Self::from_session_list(workspace, locale, sessions);
+        if let Some(error) = load_error {
+            view.status = Some(
+                tr(locale, MessageId::SessionsLoadFailed).replace("{error}", &error),
+            );
+        }
+        view
     }
 
     /// Construct a picker scoped to `workspace` over an explicit session list.
@@ -641,6 +661,9 @@ impl SessionPickerView {
             meta.title = new_title.to_string();
         }
         self.apply_sort_and_filter();
+        // The cached preview still carries the old title, so drop it before the
+        // refresh reads the cache (#6555 U08-09).
+        self.preview_cache.invalidate(&session.id);
         self.refresh_preview();
         self.status =
             Some(tr(self.locale, MessageId::SessionsRenamed).replace("{title}", new_title));
