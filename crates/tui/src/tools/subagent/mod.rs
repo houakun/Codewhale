@@ -8601,11 +8601,36 @@ impl SubAgentManager {
             .agents
             .get(agent_id)
             .and_then(|agent| agent.terminal_delivery.clone());
+
+        // Commit and persist *before* publishing the fan-in result. The previous
+        // order sent the completion first and only then fired a best-effort
+        // write, so a crash in between left the parent holding a completion the
+        // disk still called Running — and the next load reconciles that back to
+        // Interrupted (#6555 D02-10).
+        let committed = self.update_from_result_with_persist(agent_id, result.clone(), false);
+        if committed && persist_after_commit {
+            match self.persist_state() {
+                Ok(handle) => {
+                    if handle.join().is_err() {
+                        tracing::warn!(
+                            target: "subagent",
+                            "terminal persist thread panicked; publishing the completion anyway"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "subagent",
+                        %error,
+                        "failed to persist a terminal sub-agent state before publishing it"
+                    );
+                }
+            }
+        }
         if let Some(delivery) = delivery {
             delivery.deliver(self, &result);
         }
-
-        self.update_from_result_with_persist(agent_id, result, persist_after_commit)
+        committed
     }
 
     /// Project the same measured receipt for live fan-in and channel recovery.
@@ -9655,13 +9680,84 @@ static WRITE_JSON_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU
 static STATE_PUBLISH_SEQUENCES: std::sync::OnceLock<parking_lot::Mutex<HashMap<PathBuf, u64>>> =
     std::sync::OnceLock::new();
 
+/// Read the state file the way the cross-process publish guard needs it.
+///
+/// `STATE_PUBLISH_SEQUENCES` only knows this process, and
+/// [`PersistedSubAgentState::snapshot_sequence`] is documented as an in-process
+/// id: two sessions sharing one state root each believe they are the newest
+/// writer, so the second rename wipes the first session's claims, decisions and
+/// tasks (#6555 D02-01). Reading what is already published turns that race into
+/// "keep both".
+fn read_published_state(path: &Path) -> Option<PersistedSubAgentState> {
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Union two coordination ledgers by record identity.
+///
+/// Every ledger collection is append-only, so a union loses nothing; only the
+/// per-process fleet (`agents`/`workers`) is genuinely session-scoped and is
+/// deliberately not merged here.
+fn merge_coordination_records(
+    disk: CoordinationLedger,
+    local: CoordinationLedger,
+) -> CoordinationLedger {
+    fn union_by<T, K, F>(mut disk: Vec<T>, local: Vec<T>, key: F) -> Vec<T>
+    where
+        K: Eq + std::hash::Hash,
+        F: Fn(&T) -> K,
+    {
+        let mut seen: std::collections::HashSet<K> = disk.iter().map(|record| key(record)).collect();
+        for record in local {
+            if seen.insert(key(&record)) {
+                disk.push(record);
+            }
+        }
+        disk
+    }
+
+    CoordinationLedger {
+        schema_version: disk.schema_version.max(local.schema_version),
+        sequence: disk.sequence.max(local.sequence),
+        decisions: union_by(disk.decisions, local.decisions, |record| {
+            record.decision_id.clone()
+        }),
+        write_claims: union_by(disk.write_claims, local.write_claims, |record| record.sequence),
+        reconciliations: union_by(disk.reconciliations, local.reconciliations, |record| {
+            record.reconciliation_id.clone()
+        }),
+        projections: union_by(disk.projections, local.projections, |record| {
+            (record.child_id.clone(), record.sequence)
+        }),
+        contentions: union_by(disk.contentions, local.contentions, |record| record.sequence),
+        record_sessions: {
+            let mut sessions = disk.record_sessions;
+            for (sequence, session) in local.record_sessions {
+                sessions.entry(sequence).or_insert(session);
+            }
+            sessions
+        },
+    }
+}
+
 fn write_json_atomic(state_root: &Path, path: &Path, value: &PersistedSubAgentState) -> Result<()> {
     let state_root = normalize_subagent_workspace(state_root);
     reject_root_relative_symlinks(&state_root, path)?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let payload = serde_json::to_string_pretty(value)?;
+    // Cross-process half of the publish guard (#6555 D02-01). A session that
+    // loaded this file before another session published keeps its own counters,
+    // so without this fold-in the later rename silently drops the other
+    // session's coordination records. The fleet itself stays session-scoped.
+    let mut value = value.clone();
+    if let Some(disk) = read_published_state(path)
+        && disk.snapshot_sequence >= value.snapshot_sequence
+    {
+        value.coordination = merge_coordination_records(disk.coordination, value.coordination);
+        value.snapshot_sequence = disk.snapshot_sequence.saturating_add(1);
+    }
+    let payload = serde_json::to_string_pretty(&value)?;
     let seq = WRITE_JSON_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let tmp_path = path.with_extension(format!("{}.{seq}.tmp", std::process::id()));
     reject_root_relative_symlinks(&state_root, &tmp_path)?;

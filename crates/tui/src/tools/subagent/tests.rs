@@ -18907,6 +18907,72 @@ fn write_json_atomic_survives_concurrent_writers() {
 }
 
 #[test]
+fn write_json_atomic_keeps_a_newer_snapshot_from_another_session() {
+    // #6555 D02-01: two sessions sharing one state root each load the file and
+    // then count their own snapshots, so the later rename used to wipe the other
+    // session's coordination records.
+    let dir = tempdir().expect("tempdir");
+    let base = dir.path().canonicalize().expect("canonicalize tempdir");
+    let path = base.join(".codewhale").join("subagents").join("state.json");
+    std::fs::create_dir_all(path.parent().unwrap()).expect("state dir");
+
+    let mut published_by_other = PersistedSubAgentState {
+        snapshot_sequence: 5,
+        ..PersistedSubAgentState::default()
+    };
+    published_by_other
+        .coordination
+        .record_sessions
+        .insert(7, "session-other".to_string());
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(&published_by_other).expect("serialize"),
+    )
+    .expect("seed published state");
+
+    // This session loaded the file earlier and still counts from 2.
+    let mut local = PersistedSubAgentState {
+        snapshot_sequence: 2,
+        ..PersistedSubAgentState::default()
+    };
+    local
+        .coordination
+        .record_sessions
+        .insert(9, "session-local".to_string());
+    write_json_atomic(&base, &path, &local).expect("publish");
+
+    let republished: PersistedSubAgentState =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read state.json"))
+            .expect("state.json must stay valid JSON");
+
+    // The publish never goes backwards...
+    assert!(
+        republished.snapshot_sequence > 5,
+        "published sequence regressed to {}",
+        republished.snapshot_sequence
+    );
+    // ...and the other session's coordination records survive the rename.
+    assert_eq!(
+        republished
+            .coordination
+            .record_sessions
+            .get(&7)
+            .map(String::as_str),
+        Some("session-other"),
+        "the other session's records were wiped by the rename"
+    );
+    assert_eq!(
+        republished
+            .coordination
+            .record_sessions
+            .get(&9)
+            .map(String::as_str),
+        Some("session-local"),
+        "this session's records must still be published"
+    );
+}
+
+#[test]
 fn coordination_process_lock_rejects_second_process() {
     const ROLE_ENV: &str = "CODEWHALE_TEST_COORDINATION_LOCK_ROLE";
     const WORKSPACE_ENV: &str = "CODEWHALE_TEST_COORDINATION_LOCK_WORKSPACE";
