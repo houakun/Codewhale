@@ -1,7 +1,15 @@
-import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { chmod, mkdir, open, readFile, rename, rm } from "node:fs/promises";
 import path from "node:path";
 
 const DEFAULT_ACTION_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Monotonic suffix so two writers never share a temp path. */
+let tmpFileSequence = 0;
+
+/** Windows refuses a replace while another writer still holds the target. */
+const RENAME_RETRY_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const RENAME_RETRY_ATTEMPTS = 5;
+const RENAME_RETRY_BASE_MS = 10;
 
 function normalizeCursorValue(value, fallback = 0) {
   const number = Number(value);
@@ -17,6 +25,93 @@ async function chmodBestEffort(filePath, mode) {
   } catch (error) {
     if (process.platform !== "win32") throw error;
   }
+}
+
+function nextTmpFileSequence() {
+  tmpFileSequence = (tmpFileSequence + 1) % Number.MAX_SAFE_INTEGER;
+  return tmpFileSequence;
+}
+
+/**
+ * Best-effort directory fsync so the rename itself survives a crash.
+ *
+ * POSIX needs the directory entry flushed, but Windows cannot open a directory
+ * as a file and macOS rejects fsync on one. Failure is therefore never fatal:
+ * the file-level fsync in `writeFileAtomic` is what keeps the payload intact.
+ */
+async function syncDirBestEffort(dir) {
+  let handle = null;
+  try {
+    handle = await open(dir, "r");
+    await handle.sync();
+  } catch {
+    // Unsupported on this platform: the rename above already landed.
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Rename with a short retry for the platforms that can refuse a replace.
+ *
+ * On Windows `rename` is a replace, and it fails with EPERM/EBUSY while another
+ * writer is between its own temp write and rename. Retrying keeps concurrent
+ * writers from turning a benign race into a lost update.
+ */
+async function renameWithRetry(tmp, filePath) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      await rename(tmp, filePath);
+      return;
+    } catch (error) {
+      if (attempt >= RENAME_RETRY_ATTEMPTS || !RENAME_RETRY_CODES.has(error?.code)) throw error;
+      await delay(RENAME_RETRY_BASE_MS * 2 ** (attempt - 1));
+    }
+  }
+}
+
+/**
+ * Write `contents` to `filePath` so a crash leaves either the previous file or
+ * the new one, never a truncated one (#6555 X01-07).
+ *
+ * Three properties matter, and a fixed `${filePath}.tmp` had none of them:
+ * a temp name unique per writer (two writers used to truncate each other's
+ * payload before the rename), `fsync` on the handle (otherwise the rename
+ * publishes a name pointing at pages that may never reach the disk), and a
+ * directory sync after the rename (otherwise the rename itself can be lost).
+ *
+ * @param {string} filePath destination path
+ * @param {string|Uint8Array} contents bytes to publish
+ * @param {{ mode?: number }} [options] file mode, default 0o600
+ * @returns {Promise<string>} the destination path
+ */
+export async function writeFileAtomic(filePath, contents, options = {}) {
+  const mode = options.mode ?? 0o600;
+  const dir = path.dirname(filePath);
+  await mkdir(dir, { recursive: true, mode: 0o700 });
+  const tmp = `${filePath}.${process.pid}.${nextTmpFileSequence()}.tmp`;
+  const handle = await open(tmp, "w", mode);
+  try {
+    await handle.writeFile(contents);
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  // `open`'s mode is masked by umask, so pin it before the file becomes visible.
+  await chmodBestEffort(tmp, mode);
+  try {
+    await renameWithRetry(tmp, filePath);
+  } catch (error) {
+    // Never leave this writer's temp file behind when the publish failed.
+    await rm(tmp, { force: true }).catch(() => {});
+    throw error;
+  }
+  await syncDirBestEffort(dir);
+  return filePath;
 }
 
 export class ThreadStore {
@@ -63,6 +158,20 @@ export class ThreadStore {
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
+  }
+
+  /**
+   * Read-only dedupe probe: has `messageKey` already been recorded?
+   *
+   * `recordMessage` writes as part of the check, which is wrong for a caller
+   * that must not mark a message handled until the handler actually succeeded
+   * (#6555 X01-07). Returns `false` when dedupe is disabled, matching the
+   * `recordMessage` contract for `messageLimit <= 0`.
+   */
+  hasMessage(messageKey) {
+    if (!messageKey || this.options.messageLimit <= 0) return false;
+    this.ensureShape();
+    return this.data.messages.includes(messageKey);
   }
 
   async recordMessage(messageKey) {
@@ -176,14 +285,13 @@ export class ThreadStore {
   }
 
   async writeSnapshot() {
-    const dir = path.dirname(this.filePath);
-    await mkdir(dir, { recursive: true, mode: 0o700 });
-    if (this.options.privateMode) await chmodBestEffort(dir, 0o700);
-    const tmp = `${this.filePath}.tmp`;
-    await writeFile(tmp, `${JSON.stringify(this.data, null, 2)}\n`, { mode: 0o600 });
-    if (this.options.privateMode) await chmodBestEffort(tmp, 0o600);
-    await rename(tmp, this.filePath);
-    if (this.options.privateMode) await chmodBestEffort(this.filePath, 0o600);
+    await writeFileAtomic(this.filePath, `${JSON.stringify(this.data, null, 2)}\n`, {
+      mode: 0o600
+    });
+    if (this.options.privateMode) {
+      await chmodBestEffort(path.dirname(this.filePath), 0o700);
+      await chmodBestEffort(this.filePath, 0o600);
+    }
   }
 }
 

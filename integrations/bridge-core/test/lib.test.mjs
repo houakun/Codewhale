@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -19,7 +19,8 @@ import {
   readSse,
   splitMessage,
   stripGroupPrefix,
-  ThreadStore
+  ThreadStore,
+  writeFileAtomic
 } from "../src/lib.mjs";
 
 test("env and primitive parsers handle bridge env conventions", () => {
@@ -234,6 +235,110 @@ test("ThreadStore persists numeric cursors", async () => {
 
     const saved = await ThreadStore.open(statePath);
     assert.equal(saved.getCursor("telegram.update_offset"), 42);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("ThreadStore.hasMessage probes dedupe state without writing", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const statePath = path.join(dir, "thread-map.json");
+    const store = await ThreadStore.open(statePath, { messageLimit: 4 });
+
+    assert.equal(store.hasMessage("m1"), false);
+    assert.equal(store.hasMessage(""), false);
+    // A probe must not create the file: that is the whole point of the split.
+    await assert.rejects(() => readFile(statePath, "utf8"), /ENOENT/);
+
+    await store.recordMessage("m1");
+    assert.equal(store.hasMessage("m1"), true);
+
+    const before = await stat(statePath);
+    assert.equal(store.hasMessage("m1"), true);
+    assert.equal((await stat(statePath)).mtimeMs, before.mtimeMs);
+
+    const dedupeDisabled = await ThreadStore.open(path.join(dir, "no-dedupe.json"));
+    assert.equal(dedupeDisabled.hasMessage("m1"), false);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeFileAtomic publishes complete contents and leaves no temp residue", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const target = path.join(dir, "nested", "state.json");
+
+    await writeFileAtomic(target, '{"writer":"first"}\n');
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { writer: "first" });
+
+    await writeFileAtomic(target, '{"writer":"second"}\n');
+    assert.deepEqual(JSON.parse(await readFile(target, "utf8")), { writer: "second" });
+
+    assert.deepEqual(await readdir(path.dirname(target)), ["state.json"]);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("writeFileAtomic keeps concurrent writers from truncating each other", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const target = path.join(dir, "thread-map.json");
+    // A fixed `${target}.tmp` let two writers interleave into the same temp file
+    // before either renamed it, so parsing a complete payload is the regression
+    // assertion: with a shared temp name the published JSON is truncated.
+    const filler = "x".repeat(4096);
+    await Promise.all(
+      Array.from({ length: 16 }, (_, index) =>
+        writeFileAtomic(target, `${JSON.stringify({ writer: index, filler })}\n`)
+      )
+    );
+
+    const published = JSON.parse(await readFile(target, "utf8"));
+    assert.equal(Number.isInteger(published.writer), true);
+    assert.equal(published.filler.length, filler.length);
+    assert.deepEqual(
+      (await readdir(dir)).filter((name) => name.endsWith(".tmp")),
+      []
+    );
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test(
+  "writeFileAtomic pins the requested file mode",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+    try {
+      const target = path.join(dir, "state.json");
+      await writeFileAtomic(target, "{}\n", { mode: 0o600 });
+      assert.equal((await stat(target)).mode & 0o777, 0o600);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  }
+);
+
+test("ThreadStore publishes snapshots without a fixed .tmp file", async () => {
+  const dir = await mkdtemp(path.join(tmpdir(), "codewhale-bridge-core-"));
+  try {
+    const statePath = path.join(dir, "thread-map.json");
+    const store = await ThreadStore.open(statePath, { messageLimit: 4, privateMode: true });
+
+    await store.recordMessage("m1");
+    await store.patchChat("chat-a", { threadId: "thread-a" });
+
+    const entries = await readdir(dir);
+    assert.equal(entries.includes("thread-map.json"), true);
+    assert.deepEqual(
+      entries.filter((name) => name.endsWith(".tmp")),
+      []
+    );
+    assert.equal(JSON.parse(await readFile(statePath, "utf8")).messages.length, 1);
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
