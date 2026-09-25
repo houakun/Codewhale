@@ -346,3 +346,36 @@ export async function notifyStop({ baseUrl, token }) {
   });
   return JSON.parse(raw);
 }
+
+/**
+ * 消费一批服务端下发的消息。
+ *
+ * 顺序是“先查重 → 处理 → 成功后才落去重记录”，且任一条处理失败即停止本批。
+ * 调用方据此**不推进游标**，让下一轮长轮询重投这批消息（at-least-once）：
+ * 崩溃或处理失败都不会让一条已下发的消息永久消失（#6555 X01-07）。
+ *
+ * @param {object} input
+ * @param {Array<object>} input.msgs 本批消息
+ * @param {(msg: object) => string} input.keyOf 去重键，空串表示不参与去重
+ * @param {(key: string) => boolean|Promise<boolean>} input.isHandled 只读查重
+ * @param {(msg: object) => Promise<void>} input.handle 处理一条消息（含副作用）
+ * @param {(key: string) => Promise<void>} input.markHandled 处理成功后落去重记录
+ * @param {(error: Error, msg: object) => void} [input.onError] 失败日志钩子
+ * @returns {Promise<{ok: boolean, handledCount: number, error?: Error}>}
+ */
+export async function consumeUpdates({ msgs, keyOf, isHandled, handle, markHandled, onError }) {
+  let handledCount = 0;
+  for (const msg of msgs || []) {
+    const key = keyOf(msg);
+    if (key && (await isHandled(key))) continue;
+    try {
+      await handle(msg);
+    } catch (error) {
+      onError?.(error, msg);
+      return { ok: false, handledCount, error };
+    }
+    if (key) await markHandled(key);
+    handledCount += 1;
+  }
+  return { ok: true, handledCount };
+}
