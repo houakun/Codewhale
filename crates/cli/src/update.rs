@@ -1900,29 +1900,30 @@ where
 
     #[cfg(windows)]
     {
-        let backup = backup_path_for(target);
+        // One atomic replace instead of "rename the target away, then rename the
+        // staged file in": a crash between those two renames left the target
+        // missing with only the backup on disk, and the rollback error was
+        // ignored (#6555 R02-05). `ReplaceFileW` moves the old binary to the
+        // backup and publishes the staged one in a single OS-level operation
+        // with a write-through flush.
         if target.exists() {
-            std::fs::rename(target, &backup).with_context(|| {
+            let backup = backup_path_for(target);
+            replace_file_atomically(target, tmp.path(), &backup).with_context(|| {
                 format!(
-                    "failed to move current executable {} to {}",
+                    "failed to replace {} with the staged update {}",
                     target.display(),
-                    backup.display()
+                    tmp.path().display()
                 )
             })?;
-        }
-
-        if let Err(err) = tmp.persist(target) {
-            if backup.exists() {
-                let _ = std::fs::rename(&backup, target);
-            }
+            let _ = std::fs::remove_file(&backup);
+        } else if let Err(err) = tmp.persist(target) {
+            // Nothing to replace yet (first install): the staged file moves in.
             bail!(
                 "failed to install new binary at {}: {}",
                 target.display(),
                 err.error
             );
         }
-
-        let _ = std::fs::remove_file(&backup);
     }
 
     #[cfg(not(windows))]
@@ -1932,6 +1933,43 @@ where
             .with_context(|| format!("failed to rename temp file to {}", target.display()))?;
     }
 
+    Ok(())
+}
+
+/// Atomically replace `target` with `staged`, keeping the previous file at
+/// `backup`.
+///
+/// `ReplaceFileW` performs the swap in one operation, so a crash can no longer
+/// leave the target missing the way a rename-away/rename-in pair could (#6555
+/// R02-05). The target must already exist; callers handle first install
+/// separately.
+#[cfg(windows)]
+fn replace_file_atomically(target: &Path, staged: &Path, backup: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Storage::FileSystem::{REPLACEFILE_WRITE_THROUGH, ReplaceFileW};
+    use windows::core::PCWSTR;
+
+    fn wide(path: &Path) -> Vec<u16> {
+        path.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+
+    let target_w = wide(target);
+    let staged_w = wide(staged);
+    let backup_w = wide(backup);
+    // SAFETY: all three pointers are NUL-terminated buffers that outlive the call.
+    let result = unsafe {
+        ReplaceFileW(
+            PCWSTR(target_w.as_ptr()),
+            PCWSTR(staged_w.as_ptr()),
+            PCWSTR(backup_w.as_ptr()),
+            REPLACEFILE_WRITE_THROUGH,
+            None,
+            None,
+        )
+    };
+    if result.is_err() {
+        return Err(std::io::Error::last_os_error());
+    }
     Ok(())
 }
 
