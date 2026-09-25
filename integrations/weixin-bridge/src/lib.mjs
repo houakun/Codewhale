@@ -106,6 +106,19 @@ export function helpText() {
 
 export const ILinkLoginBase = "https://ilinkai.weixin.qq.com";
 
+/**
+ * Parse an iLink response body, naming the endpoint when the payload is not
+ * JSON. A bare SyntaxError from `JSON.parse` hides which call returned an HTML
+ * error page or an empty body.
+ */
+function parseApiResponse(raw, endpoint) {
+  try {
+    return JSON.parse(raw);
+  } catch (error) {
+    throw new Error(`iLink ${endpoint} returned a non-JSON body: ${error?.message ?? error}`);
+  }
+}
+
 function authHeaders({ token } = {}) {
   const headers = {
     "Content-Type": "application/json",
@@ -196,7 +209,7 @@ export async function getLoginQR({ botType = "3" } = {}) {
     endpoint: `ilink/bot/get_bot_qrcode?bot_type=${encodeURIComponent(botType)}`,
     body: JSON.stringify({ local_token_list: [] }),
   });
-  const data = JSON.parse(raw);
+  const data = parseApiResponse(raw, "get_bot_qrcode");
   const qrcodeUrl = data.qrcode_img_content || "";
   const sessionKey = data.qrcode || crypto.randomUUID();
   return { qrcode: data.qrcode, qrcodeUrl, sessionKey };
@@ -224,7 +237,7 @@ export async function waitForLogin({ sessionKey, timeoutMs = 300_000 } = {}) {
       continue;
     }
 
-    const data = JSON.parse(raw);
+    const data = parseApiResponse(raw, "get_qrcode_status");
     const status = data.status;
 
     if (status === "confirmed") {
@@ -268,7 +281,7 @@ export async function getUpdates({ baseUrl, token, get_updates_buf = "", timeout
     timeoutMs,
     signal,
   });
-  return JSON.parse(raw);
+  return parseApiResponse(raw, "getupdates");
 }
 
 /**
@@ -318,7 +331,7 @@ export async function getConfig({ baseUrl, token, ilinkUserId, contextToken }) {
     }),
     token,
   });
-  return JSON.parse(raw);
+  return parseApiResponse(raw, "getconfig");
 }
 
 /**
@@ -331,7 +344,7 @@ export async function notifyStart({ baseUrl, token }) {
     body: JSON.stringify({ base_info: { bot_agent: "CodeWhale/1.0" } }),
     token,
   });
-  return JSON.parse(raw);
+  return parseApiResponse(raw, "notifystart");
 }
 
 /**
@@ -344,7 +357,7 @@ export async function notifyStop({ baseUrl, token }) {
     body: JSON.stringify({ base_info: { bot_agent: "CodeWhale/1.0" } }),
     token,
   });
-  return JSON.parse(raw);
+  return parseApiResponse(raw, "notifystop");
 }
 
 /**
