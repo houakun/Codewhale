@@ -1,16 +1,13 @@
 import fs from "node:fs/promises";
 import path from "node:path";
-import crypto from "node:crypto";
 
 import {
   getLoginQR,
   waitForLogin,
   getUpdates,
   sendMessage,
-  getConfig,
   notifyStart,
   notifyStop,
-  ILinkLoginBase,
   parseList,
   parseBool,
   envFirst,
@@ -67,15 +64,6 @@ async function saveAccount(stateDir, account) {
 // ============================================================================
 // 配置
 // ============================================================================
-
-function requiredEnv(name) {
-  const value = process.env[name];
-  if (!value || !value.trim()) {
-    console.error(`Missing required env: ${name}`);
-    process.exit(1);
-  }
-  return value.trim();
-}
 
 function requiredEnvFirst(...names) {
   const value = envFirst(process.env, ...names);
@@ -696,7 +684,6 @@ async function setChatModel(chatId, modelName) {
 let botAccount = null;
 let stopping = false;
 let threadStore;
-let stopSignal = null;
 
 function resolveSyncBufPath(stateDir) {
   return path.join(stateDir, "sync-buf.txt");
